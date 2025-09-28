@@ -8,7 +8,11 @@ __pycache__/
 
 # Distribution / packaging
 .Python
+pipeline/
 build/
+cookies/
+node_modules/
+package-lock.json
 develop-eggs/
 dist/
 downloads/
