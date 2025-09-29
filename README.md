@@ -53,7 +53,7 @@ Provide SMTP credentials (e.g., Gmail app password). Defaults:
 - `SMTP_SECURE=true`
 - `REPORT_RECIPIENT` can include multiple comma-separated addresses.
 
-### Optional AI Highlights
+### AI Highlights (required)
 
 Set `GOOGLE_AI_API_KEY` (and optional `GOOGLE_AI_MODEL`) to add Gemini-based bullet summaries of each account’s activity.
 
@@ -70,6 +70,7 @@ Set `GOOGLE_AI_API_KEY` (and optional `GOOGLE_AI_MODEL`) to add Gemini-based bul
 - Twitter artifacts: `pipeline/<account>/<timestamp>/`
 - Agent state: `agent_data/state.json`
 - Cookies maintained in `cookies/`
+
 
 
 
