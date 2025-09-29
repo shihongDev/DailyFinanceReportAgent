@@ -5,11 +5,13 @@ import { format } from 'date-fns';
 import Logger from './Logger.js';
 
 class DataOrganizer {
-  constructor(baseDir, username) {
+  constructor(baseDir, username, options = {}) {
+    this.runDate = options.runDate instanceof Date ? options.runDate : new Date();
+    const folderStamp = format(this.runDate, 'yyyy-MM-dd_HH-mm');
     this.baseDir = path.join(
       baseDir,
       username.toLowerCase(),
-      format(new Date(), 'yyyy-MM-dd')
+      folderStamp
     );
     this.createDirectories();
   }
@@ -23,9 +25,9 @@ class DataOrganizer {
       const fullPath = path.join(this.baseDir, dir);
       try {
         await fs.mkdir(fullPath, { recursive: true });
-        Logger.info(`✅ Created directory: ${path.join(this.baseDir, dir)}`);
+        Logger.info(`Created directory: ${path.join(this.baseDir, dir)}`);
       } catch (error) {
-        Logger.warn(`⚠️  Failed to create directory ${fullPath}: ${error.message}`);
+        Logger.warn(`Failed to create directory ${fullPath}: ${error.message}`);
       }
     }
   }
@@ -65,7 +67,7 @@ class DataOrganizer {
       Logger.debug(`Retrieved last next_token: ${trimmed}`);
       return trimmed || null;
     } catch (error) {
-      Logger.warn(`⚠️  No next_token found. Starting fresh.`);
+      Logger.warn(`  No next_token found. Starting fresh.`);
       return null;
     }
   }
@@ -78,9 +80,9 @@ class DataOrganizer {
   async saveNextToken(nextToken) {
     try {
       await fs.writeFile(this.getPaths().meta.nextToken, nextToken, 'utf-8');
-      Logger.debug(`✅ Saved next_token: ${nextToken}`);
+      Logger.debug(` Saved next_token: ${nextToken}`);
     } catch (error) {
-      Logger.warn(`⚠️  Failed to save next_token: ${error.message}`);
+      Logger.warn(`  Failed to save next_token: ${error.message}`);
     }
   }
 
@@ -99,12 +101,12 @@ class DataOrganizer {
         JSON.stringify(tweets, null, 2),
         'utf-8'
       );
-      Logger.success(`✅ Saved tweets to ${paths.raw.tweets}`);
+      Logger.success(` Saved tweets to ${paths.raw.tweets}`);
 
       // Save tweet URLs
       const urls = tweets.map((t) => t.permanentUrl);
       await fs.writeFile(paths.raw.urls, urls.join('\n'), 'utf-8');
-      Logger.success(`✅ Saved tweet URLs to ${paths.raw.urls}`);
+      Logger.success(` Saved tweet URLs to ${paths.raw.urls}`);
 
       // Generate and save analytics
       const analytics = this.generateAnalytics(tweets);
@@ -113,12 +115,12 @@ class DataOrganizer {
         JSON.stringify(analytics, null, 2),
         'utf-8'
       );
-      Logger.success(`✅ Saved analytics to ${paths.analytics.stats}`);
+      Logger.success(` Saved analytics to ${paths.analytics.stats}`);
 
       // Generate and save fine-tuning data
       const finetuningData = this.generateFinetuningData(tweets);
       Logger.info(
-        `ℹ️  Generating fine-tuning data with ${finetuningData.length} entries`
+        `  Generating fine-tuning data with ${finetuningData.length} entries`
       );
 
       if (finetuningData.length > 0) {
@@ -128,20 +130,20 @@ class DataOrganizer {
           'utf-8'
         );
         Logger.success(
-          `✅ Saved fine-tuning data to ${paths.processed.finetuning}`
+          ` Saved fine-tuning data to ${paths.processed.finetuning}`
         );
       } else {
-        Logger.warn('⚠️  No fine-tuning data to save.');
+        Logger.warn('  No fine-tuning data to save.');
       }
 
       // Generate and save summary
       const summary = this.generateSummary(tweets, analytics);
       await fs.writeFile(paths.exports.summary, summary, 'utf-8');
-      Logger.success(`✅ Saved summary to ${paths.exports.summary}`);
+      Logger.success(` Saved summary to ${paths.exports.summary}`);
 
       return analytics;
     } catch (error) {
-      Logger.error(`❌ Error saving data: ${error.message}`);
+      Logger.error(` Error saving data: ${error.message}`);
       throw error;
     }
   }
@@ -153,7 +155,7 @@ class DataOrganizer {
    */
   generateAnalytics(tweets) {
     if (tweets.length === 0) {
-      Logger.warn('⚠️  No tweets to analyze.');
+      Logger.warn('  No tweets to analyze.');
       return {
         totalTweets: 0,
         directTweets: 0,
@@ -184,7 +186,7 @@ class DataOrganizer {
 
     if (invalidTweets.length > 0) {
       Logger.warn(
-        `⚠️  Found ${invalidTweets.length} tweets with invalid or missing dates. They will be excluded from analytics.`
+        `  Found ${invalidTweets.length} tweets with invalid or missing dates. They will be excluded from analytics.`
       );
     }
 
@@ -229,10 +231,10 @@ class DataOrganizer {
       },
       timeRange: {
         start: validDates.length
-          ? format(new Date(validDates[0]), 'yyyy-MM-dd')
+          ? format(new Date(validDates[0]), 'yyyy-MM-dd HH:mm')
           : 'N/A',
         end: validDates.length
-          ? format(new Date(validDates[validDates.length - 1]), 'yyyy-MM-dd')
+          ? format(new Date(validDates[validDates.length - 1]), 'yyyy-MM-dd HH:mm')
           : 'N/A',
       },
       contentTypes: {
@@ -308,7 +310,7 @@ class DataOrganizer {
 
 ## Top Tweets
 ${analytics.engagement.topTweets
-  .map((t) => `- [${t.likes} likes] ${t.text}...\n  • ${t.url}`)
+  .map((t) => `- [${t.likes} likes] ${t.text}...\n   ${t.url}`)
   .join('\n\n')}
 
 ## Storage Details
@@ -319,3 +321,4 @@ Raw data, analytics, and exports can be found in:
 }
 
 export default DataOrganizer;
+

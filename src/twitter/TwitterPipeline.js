@@ -23,9 +23,14 @@ puppeteer.use(StealthPlugin());
 puppeteer.use(AdblockerPlugin({ blockTrackers: true }));
 
 class TwitterPipeline {
-  constructor(username) {
+  constructor(username, options = {}) {
     this.username = username;
-    this.dataOrganizer = new DataOrganizer("pipeline", username);
+    this.options = this.normalizeOptions(options);
+    this.runTimestamp = new Date();
+    this.lastCollectedTweets = [];
+    this.dataOrganizer = new DataOrganizer("pipeline", username, {
+      runDate: this.runTimestamp,
+    });
     this.paths = this.dataOrganizer.getPaths();
     this.tweetFilter = new TweetFilter();
 
@@ -74,6 +79,127 @@ class TwitterPipeline {
       newestTweetDate: null,
       fallbackUsed: false,
     };
+
+    if (this.options.limit) {
+      const limitBudget = Math.max(this.options.limit, this.options.limit * 2);
+      this.config.twitter.maxTweets = Math.min(
+        this.config.twitter.maxTweets,
+        limitBudget
+      );
+    }
+
+    if (this.options.maxTweets) {
+      this.config.twitter.maxTweets = Math.min(
+        this.config.twitter.maxTweets,
+        this.options.maxTweets
+      );
+    }
+  }
+
+  normalizeOptions(options = {}) {
+    const limitValue =
+      options.limit === undefined ? null : Number(options.limit);
+    const maxTweetsValue =
+      options.maxTweets === undefined ? null : Number(options.maxTweets);
+    const windowHoursValue =
+      options.windowHours === undefined ? null : Number(options.windowHours);
+
+    const normalized = {
+      interactive: options.interactive !== false,
+      since: this.parseToTimestamp(options.since),
+      until: this.parseToTimestamp(options.until),
+      limit:
+        Number.isFinite(limitValue) && limitValue > 0
+          ? Math.floor(limitValue)
+          : null,
+      maxTweets:
+        Number.isFinite(maxTweetsValue) && maxTweetsValue > 0
+          ? Math.floor(maxTweetsValue)
+          : null,
+    };
+
+    if (
+      !normalized.since &&
+      Number.isFinite(windowHoursValue) &&
+      windowHoursValue > 0
+    ) {
+      normalized.since = Date.now() - windowHoursValue * 60 * 60 * 1000;
+    }
+
+    if (normalized.until && normalized.since && normalized.until < normalized.since) {
+      [normalized.since, normalized.until] = [normalized.until, normalized.since];
+    }
+
+    return normalized;
+  }
+
+  parseToTimestamp(value) {
+    if (!value && value !== 0) return null;
+
+    if (value instanceof Date) {
+      return value.getTime();
+    }
+
+    if (typeof value === 'number') {
+      return Number.isFinite(value) ? value : null;
+    }
+
+    if (typeof value === 'string') {
+      const trimmed = value.trim();
+      if (!trimmed) return null;
+
+      if (/^\d+$/.test(trimmed)) {
+        const numericValue = Number(trimmed);
+        return Number.isFinite(numericValue) ? numericValue : null;
+      }
+
+      const parsed = Date.parse(trimmed);
+      if (!Number.isNaN(parsed)) {
+        return parsed;
+      }
+    }
+
+    return null;
+  }
+
+  normalizeTimestamp(raw) {
+    if (raw === null || raw === undefined) return null;
+
+    let timestamp = raw;
+    if (timestamp instanceof Date) {
+      timestamp = timestamp.getTime();
+    }
+
+    if (typeof timestamp === 'string' && /^\d+$/.test(timestamp)) {
+      timestamp = Number(timestamp);
+    }
+
+    if (typeof timestamp !== 'number' || Number.isNaN(timestamp)) {
+      return null;
+    }
+
+    if (timestamp < 1e12) {
+      timestamp *= 1000;
+    }
+
+    return timestamp > 0 ? timestamp : null;
+  }
+
+  isTweetWithinRange(timestamp) {
+    if (!timestamp) return false;
+    if (this.options.until && timestamp > this.options.until) {
+      return false;
+    }
+    if (this.options.since && timestamp < this.options.since) {
+      return false;
+    }
+    return true;
+  }
+
+  getCollectedTweets() {
+    return Array.isArray(this.lastCollectedTweets)
+      ? this.lastCollectedTweets
+      : [];
   }
 
   async initializeFallback() {
@@ -117,7 +243,7 @@ class TwitterPipeline {
       Logger.stopSpinner(false);
       Logger.error("Missing required environment variables:");
       missing.forEach((var_) => Logger.error(`- ${var_}`));
-      console.log("\n📝 Create a .env file with your Twitter credentials:");
+      console.log("\n Create a .env file with your Twitter credentials:");
       console.log(`TWITTER_USERNAME=your_username`);
       console.log(`TWITTER_PASSWORD=your_password`);
       process.exit(1);
@@ -160,7 +286,7 @@ async saveCookies() {
     if (await this.loadCookies()) {
       try {
         if (await this.scraper.isLoggedIn()) {
-          Logger.success("✅ Successfully authenticated with saved cookies");
+          Logger.success("Successfully authenticated with saved cookies");
           Logger.stopSpinner();
           return true;
         }
@@ -193,7 +319,7 @@ async saveCookies() {
         const isLoggedIn = await this.scraper.isLoggedIn();
         if (isLoggedIn) {
           await this.saveCookies();
-          Logger.success("✅ Successfully authenticated with Twitter");
+          Logger.success("Successfully authenticated with Twitter");
           Logger.stopSpinner();
           return true;
         } else {
@@ -203,7 +329,7 @@ async saveCookies() {
       } catch (error) {
         retryCount++;
         Logger.warn(
-          `⚠️  Authentication attempt ${retryCount} failed: ${error.message}`
+          `  Authentication attempt ${retryCount} failed: ${error.message}`
         );
 
         if (retryCount >= this.config.twitter.maxRetries) {
@@ -253,7 +379,7 @@ async saveCookies() {
         await this.scraper.login(username, password);
 
         if (await this.scraper.isLoggedIn()) {
-          Logger.success("✅ Successfully authenticated with Twitter");
+          Logger.success("Successfully authenticated with Twitter");
           Logger.stopSpinner();
           return true;
         } else {
@@ -262,7 +388,7 @@ async saveCookies() {
       } catch (error) {
         retryCount++;
         Logger.warn(
-          `⚠️  Authentication attempt ${retryCount} failed: ${error.message}`
+          `  Authentication attempt ${retryCount} failed: ${error.message}`
         );
 
         if (retryCount >= this.config.twitter.maxRetries) {
@@ -306,7 +432,7 @@ async saveCookies() {
     const delay = Math.min(exponentialDelay + jitter, maxDelay);
 
     Logger.warn(
-      `⚠️  Rate limit hit - waiting ${
+      `  Rate limit hit - waiting ${
         delay / 1000
       } seconds (attempt ${retryCount})`
     );
@@ -318,17 +444,16 @@ async saveCookies() {
     try {
       if (!tweet || !tweet.id) return null;
 
-      let timestamp = tweet.timestamp;
+      const timestamp = this.normalizeTimestamp(
+        tweet.timestamp ?? tweet.timeParsed?.getTime()
+      );
+
       if (!timestamp) {
-        timestamp = tweet.timeParsed?.getTime();
+        Logger.warn(`Invalid timestamp for tweet ${tweet.id}`);
+        return null;
       }
 
-      if (!timestamp) return null;
-
-      if (timestamp < 1e12) timestamp *= 1000;
-
-      if (isNaN(timestamp) || timestamp <= 0) {
-        Logger.warn(`⚠️  Invalid timestamp for tweet ${tweet.id}`);
+      if (!this.isTweetWithinRange(timestamp)) {
         return null;
       }
 
@@ -366,7 +491,7 @@ async saveCookies() {
         hashtags: tweet.hashtags || [],
       };
     } catch (error) {
-      Logger.warn(`⚠️  Error processing tweet ${tweet?.id}: ${error.message}`);
+      Logger.warn(`  Error processing tweet ${tweet?.id}: ${error.message}`);
       return null;
     }
   }
@@ -376,7 +501,7 @@ async saveCookies() {
       await this.initializeFallback();
     }
 
-    const tweets = new Set();
+    const tweets = new Map();
     let sessionStartTime = Date.now();
 
     const fallbackTask = async ({ page }) => {
@@ -447,10 +572,29 @@ async saveCookies() {
           });
 
           for (const tweet of newTweets) {
+            if (this.options.limit && tweets.size >= this.options.limit) {
+              break;
+            }
+
+            const normalizedTimestamp = this.normalizeTimestamp(
+              tweet.timestamp ? Date.parse(tweet.timestamp) : null
+            );
+
+            if (!this.isTweetWithinRange(normalizedTimestamp)) {
+              continue;
+            }
+
             if (!tweets.has(tweet.id)) {
-              tweets.add(tweet);
+              tweets.set(tweet.id, {
+                ...tweet,
+                timestamp: normalizedTimestamp,
+              });
               this.stats.fallbackCount++;
             }
+          }
+
+          if (this.options.limit && tweets.size >= this.options.limit) {
+            break;
           }
 
           if (tweets.size === lastTweetCount) {
@@ -469,7 +613,7 @@ async saveCookies() {
     await this.cluster.task(fallbackTask);
     await this.cluster.queue({});
 
-    return Array.from(tweets);
+    return Array.from(tweets.values());
   }
 
   async collectTweets(scraper) {
@@ -478,7 +622,7 @@ async saveCookies() {
       const totalExpectedTweets = profile.tweetsCount;
 
       Logger.info(
-        `📊 Found ${chalk.bold(
+        ` Found ${chalk.bold(
           totalExpectedTweets.toLocaleString()
         )} total tweets for @${this.username}`
       );
@@ -487,6 +631,8 @@ async saveCookies() {
       let previousCount = 0;
       let stagnantBatches = 0;
       const MAX_STAGNANT_BATCHES = 2;
+      let limitReached = false;
+      let timeBoundaryReached = false;
 
       // Try main collection first
       try {
@@ -497,10 +643,39 @@ async saveCookies() {
         );
 
         for await (const tweet of searchResults) {
-          if (tweet && !allTweets.has(tweet.id)) {
+          if (!tweet) continue;
+
+          const normalizedTimestamp = this.normalizeTimestamp(
+            tweet.timestamp ?? tweet.timeParsed?.getTime()
+          );
+
+          if (
+            this.options.until &&
+            normalizedTimestamp &&
+            normalizedTimestamp > this.options.until
+          ) {
+            continue;
+          }
+
+          if (
+            this.options.since &&
+            normalizedTimestamp &&
+            normalizedTimestamp < this.options.since
+          ) {
+            timeBoundaryReached = true;
+            break;
+          }
+
+          if (!allTweets.has(tweet.id)) {
             const processedTweet = this.processTweetData(tweet);
             if (processedTweet) {
               allTweets.set(tweet.id, processedTweet);
+              this.stats.uniqueTweets = allTweets.size;
+
+              if (this.options.limit && allTweets.size >= this.options.limit) {
+                limitReached = true;
+                break;
+              }
 
               if (allTweets.size % 100 === 0) {
                 const completion = (
@@ -508,14 +683,14 @@ async saveCookies() {
                   100
                 ).toFixed(1);
                 Logger.info(
-                  `📊 Progress: ${allTweets.size.toLocaleString()} unique tweets (${completion}%)`
+                  `Progress: ${allTweets.size.toLocaleString()} unique tweets (${completion}%)`
                 );
 
                 if (allTweets.size === previousCount) {
                   stagnantBatches++;
                   if (stagnantBatches >= MAX_STAGNANT_BATCHES) {
                     Logger.info(
-                      "📝 Collection rate has stagnated, checking fallback..."
+                      "Collection rate has stagnated, checking fallback..."
                     );
                     break;
                   }
@@ -527,39 +702,64 @@ async saveCookies() {
             }
           }
         }
+
+        if (limitReached) {
+          Logger.info(
+            `Reached limit of ${this.options.limit} tweets during primary collection.`
+          );
+        }
+
+        if (timeBoundaryReached) {
+          Logger.info(
+            "Reached requested time window during primary collection."
+          );
+        }
+
       } catch (error) {
         if (error.message.includes("rate limit")) {
           await this.handleRateLimit(this.stats.rateLimitHits + 1);
 
           // Consider fallback if rate limits are frequent
           if (
-            this.stats.rateLimitHits >= this.config.twitter.rateLimitThreshold
+            this.stats.rateLimitHits >= this.config.twitter.rateLimitThreshold &&
+            this.config.fallback.enabled &&
+            !limitReached &&
+            !timeBoundaryReached
           ) {
             Logger.info("Switching to fallback collection...");
             const fallbackTweets = await this.collectWithFallback(
               `from:${this.username}`
             );
 
-            fallbackTweets.forEach((tweet) => {
+            for (const tweet of fallbackTweets) {
+              if (limitReached) break;
               if (!allTweets.has(tweet.id)) {
                 const processedTweet = this.processTweetData(tweet);
                 if (processedTweet) {
                   allTweets.set(tweet.id, processedTweet);
                   this.stats.fallbackUsed = true;
+                  this.stats.uniqueTweets = allTweets.size;
+
+                  if (this.options.limit && allTweets.size >= this.options.limit) {
+                    limitReached = true;
+                    break;
+                  }
                 }
               }
-            });
+            }
           }
         }
-        Logger.warn(`⚠️  Search error: ${error.message}`);
+        Logger.warn(`  Search error: ${error.message}`);
       }
 
       // Use fallback for replies if needed
       if (
+        !limitReached &&
+        !timeBoundaryReached &&
         allTweets.size < totalExpectedTweets * 0.8 &&
         this.config.fallback.enabled
       ) {
-        Logger.info("\n🔍 Collecting additional tweets via fallback...");
+        Logger.info("\n Collecting additional tweets via fallback...");
 
         try {
           const fallbackTweets = await this.collectWithFallback(
@@ -567,16 +767,23 @@ async saveCookies() {
           );
           let newTweetsCount = 0;
 
-          fallbackTweets.forEach((tweet) => {
+          for (const tweet of fallbackTweets) {
+            if (limitReached) break;
             if (!allTweets.has(tweet.id)) {
               const processedTweet = this.processTweetData(tweet);
               if (processedTweet) {
                 allTweets.set(tweet.id, processedTweet);
                 newTweetsCount++;
                 this.stats.fallbackUsed = true;
+                this.stats.uniqueTweets = allTweets.size;
+
+                if (this.options.limit && allTweets.size >= this.options.limit) {
+                  limitReached = true;
+                  break;
+                }
               }
             }
-          });
+          }
 
           if (newTweetsCount > 0) {
             Logger.info(
@@ -584,18 +791,19 @@ async saveCookies() {
             );
           }
         } catch (error) {
-          Logger.warn(`⚠️  Fallback collection error: ${error.message}`);
+          Logger.warn(`  Fallback collection error: ${error.message}`);
         }
       }
 
       Logger.success(
-        `\n🎉 Collection complete! ${allTweets.size.toLocaleString()} unique tweets collected${
+        `\n Collection complete! ${allTweets.size.toLocaleString()} unique tweets collected${
           this.stats.fallbackUsed
             ? ` (including ${this.stats.fallbackCount} from fallback)`
             : ""
         }`
       );
 
+      this.stats.uniqueTweets = allTweets.size;
       return Array.from(allTweets.values());
     } catch (error) {
       Logger.error(`Failed to collect tweets: ${error.message}`);
@@ -604,6 +812,10 @@ async saveCookies() {
   }
 
   async showSampleTweets(tweets) {
+    if (this.options.interactive === false) {
+      return;
+    }
+
     const { showSample } = await inquirer.prompt([
       {
         type: "confirm",
@@ -614,7 +826,7 @@ async saveCookies() {
     ]);
 
     if (showSample) {
-      Logger.info("\n🌟 Sample Tweets (Most Engaging):");
+      Logger.info("\n Sample Tweets (Most Engaging):");
 
       const sortedTweets = tweets
         .filter((tweet) => !tweet.isRetweet)
@@ -630,10 +842,10 @@ async saveCookies() {
         console.log(chalk.white(tweet.text));
         console.log(
           chalk.gray(
-            `❤️ ${tweet.likes.toLocaleString()} | 🔄 ${tweet.retweetCount.toLocaleString()} | 💬 ${tweet.replies.toLocaleString()}`
+            ` ${tweet.likes.toLocaleString()} |  ${tweet.retweetCount.toLocaleString()} |  ${tweet.replies.toLocaleString()}`
           )
         );
-        console.log(chalk.gray(`🔗 ${tweet.permanentUrl}`));
+        console.log(chalk.gray(` ${tweet.permanentUrl}`));
       });
     }
   }
@@ -645,8 +857,9 @@ async saveCookies() {
 
   async run() {
     const startTime = Date.now();
+    this.lastCollectedTweets = [];
 
-    console.log("\n" + chalk.bold.blue("🐦 Twitter Data Collection Pipeline"));
+    console.log("\n" + chalk.bold.blue(" Twitter Data Collection Pipeline"));
     console.log(
       chalk.bold(`Target Account: ${chalk.cyan("@" + this.username)}\n`)
     );
@@ -665,10 +878,12 @@ async saveCookies() {
       // Start collection
       Logger.startSpinner(`Collecting tweets from @${this.username}`);
       const allTweets = await this.collectTweets(this.scraper);
+      this.lastCollectedTweets = allTweets;
+      this.stats.uniqueTweets = allTweets.length;
       Logger.stopSpinner();
 
       if (allTweets.length === 0) {
-        Logger.warn("⚠️  No tweets collected");
+        Logger.warn("No tweets collected");
         return;
       }
 
@@ -680,14 +895,16 @@ async saveCookies() {
       // Calculate final statistics
       const duration = ((Date.now() - startTime) / 1000).toFixed(1);
       const tweetsPerMinute = (allTweets.length / (duration / 60)).toFixed(1);
-      const successRate = (
-        (allTweets.length /
-          (this.stats.requestCount + this.stats.fallbackCount)) *
-        100
-      ).toFixed(1);
+      const totalRequests =
+        this.stats.requestCount + this.stats.fallbackCount;
+      const successRate =
+        totalRequests > 0
+          ? ((allTweets.length / totalRequests) * 100).toFixed(1)
+          : null;
+      const successRateDisplay = successRate ? `${successRate}%` : 'N/A';
 
       // Display final results
-      Logger.stats("📈 Collection Results", {
+      Logger.stats("Collection Results", {
         "Total Tweets": allTweets.length.toLocaleString(),
         "Original Tweets": analytics.directTweets.toLocaleString(),
         Replies: analytics.replies.toLocaleString(),
@@ -695,69 +912,69 @@ async saveCookies() {
         "Date Range": `${analytics.timeRange.start} to ${analytics.timeRange.end}`,
         Runtime: `${duration} seconds`,
         "Collection Rate": `${tweetsPerMinute} tweets/minute`,
-        "Success Rate": `${successRate}%`,
+        "Success Rate": successRateDisplay,
         "Rate Limit Hits": this.stats.rateLimitHits.toLocaleString(),
         "Fallback Collections": this.stats.fallbackCount.toLocaleString(),
         "Storage Location": chalk.gray(this.dataOrganizer.baseDir),
       });
 
       // Content type breakdown
-      Logger.info("\n📊 Content Type Breakdown:");
+      Logger.info("\nContent Type Breakdown:");
       console.log(
         chalk.cyan(
-          `• Text Only: ${analytics.contentTypes.textOnly.toLocaleString()}`
+          `Text Only: ${analytics.contentTypes.textOnly.toLocaleString()}`
         )
       );
       console.log(
         chalk.cyan(
-          `• With Images: ${analytics.contentTypes.withImages.toLocaleString()}`
+          `With Images: ${analytics.contentTypes.withImages.toLocaleString()}`
         )
       );
       console.log(
         chalk.cyan(
-          `• With Videos: ${analytics.contentTypes.withVideos.toLocaleString()}`
+          `With Videos: ${analytics.contentTypes.withVideos.toLocaleString()}`
         )
       );
       console.log(
         chalk.cyan(
-          `• With Links: ${analytics.contentTypes.withLinks.toLocaleString()}`
+          `With Links: ${analytics.contentTypes.withLinks.toLocaleString()}`
         )
       );
 
       // Engagement statistics
-      Logger.info("\n💫 Engagement Statistics:");
+      Logger.info("\nEngagement Statistics:");
       console.log(
         chalk.cyan(
-          `• Total Likes: ${analytics.engagement.totalLikes.toLocaleString()}`
+          `Total Likes: ${analytics.engagement.totalLikes.toLocaleString()}`
         )
       );
       console.log(
         chalk.cyan(
-          `• Total Retweets: ${analytics.engagement.totalRetweetCount.toLocaleString()}`
+          `Total Retweets: ${analytics.engagement.totalRetweetCount.toLocaleString()}`
         )
       );
       console.log(
         chalk.cyan(
-          `• Total Replies: ${analytics.engagement.totalReplies.toLocaleString()}`
+          `Total Replies: ${analytics.engagement.totalReplies.toLocaleString()}`
         )
       );
       console.log(
-        chalk.cyan(`• Average Likes: ${analytics.engagement.averageLikes}`)
+        chalk.cyan(`Average Likes: ${analytics.engagement.averageLikes}`)
       );
 
       // Collection method breakdown
       if (this.stats.fallbackUsed) {
-        Logger.info("\n🔄 Collection Method Breakdown:");
+        Logger.info("\n Collection Method Breakdown:");
         console.log(
           chalk.cyan(
-            `• Primary Collection: ${(
+            `Primary Collection: ${(
               allTweets.length - this.stats.fallbackCount
             ).toLocaleString()}`
           )
         );
         console.log(
           chalk.cyan(
-            `• Fallback Collection: ${this.stats.fallbackCount.toLocaleString()}`
+            `Fallback Collection: ${this.stats.fallbackCount.toLocaleString()}`
           )
         );
       }
@@ -843,33 +1060,38 @@ async saveCookies() {
       // Cleanup main scraper
       if (this.scraper) {
         await this.scraper.logout();
-        Logger.success("🔒 Logged out of primary system");
+        Logger.success(" Logged out of primary system");
       }
 
       // Cleanup fallback system
       if (this.cluster) {
         await this.cluster.close();
-        Logger.success("🔒 Cleaned up fallback system");
+        Logger.success(" Cleaned up fallback system");
       }
 
-      await this.saveProgress(null, null, this.stats.uniqueTweets, {
-        completed: true,
-        endTime: new Date().toISOString(),
-        fallbackUsed: this.stats.fallbackUsed,
-        fallbackCount: this.stats.fallbackCount,
-        rateLimitHits: this.stats.rateLimitHits,
-      });
+      if (typeof this.saveProgress === 'function') {
+        await this.saveProgress(null, null, this.stats.uniqueTweets, {
+          completed: true,
+          endTime: new Date().toISOString(),
+          fallbackUsed: this.stats.fallbackUsed,
+          fallbackCount: this.stats.fallbackCount,
+          rateLimitHits: this.stats.rateLimitHits,
+        });
+      }
 
-      Logger.success("✨ Cleanup complete");
+      Logger.success("Cleanup complete");
     } catch (error) {
-      Logger.warn(`⚠️  Cleanup error: ${error.message}`);
-      await this.saveProgress(null, null, this.stats.uniqueTweets, {
-        completed: true,
-        endTime: new Date().toISOString(),
-        error: error.message,
-      });
+      Logger.warn(`Cleanup error: ${error.message}`);
+      if (typeof this.saveProgress === 'function') {
+        await this.saveProgress(null, null, this.stats.uniqueTweets, {
+          completed: true,
+          endTime: new Date().toISOString(),
+          error: error.message,
+        });
+      }
     }
   }
 }
 
 export default TwitterPipeline;
+
