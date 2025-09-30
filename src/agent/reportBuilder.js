@@ -1,6 +1,14 @@
 import { format } from 'date-fns';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import Logger from '../twitter/Logger.js';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { tmpdir } from 'os';
+import { randomUUID } from 'crypto';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
 
 const DEFAULT_AI_MODEL = process.env.GOOGLE_AI_MODEL || 'gemini-1.5-pro-latest';
 const MAX_PROMPT_TWEETS = 12;
@@ -15,7 +23,7 @@ const htmlEscapes = {
 };
 
 function escapeHtml(value = '') {
-  return String(value).replace(/[&<>\"']/g, (char) => htmlEscapes[char] || char);
+  return String(value).replace(/[&<>"']/g, (char) => htmlEscapes[char] || char);
 }
 
 function toLocaleNumber(value = 0) {
@@ -60,7 +68,15 @@ function computeMetrics(tweets) {
       (a, b) =>
         (b.likes || 0) + (b.retweetCount || 0) - ((a.likes || 0) + (a.retweetCount || 0))
     )
-    .slice(0, MAX_TOP_TWEETS);
+    .slice(0, MAX_TOP_TWEETS)
+    .map((tweet) => ({
+      timestamp: tweet.timestamp,
+      text: tweet.text,
+      likes: tweet.likes || 0,
+      retweets: tweet.retweetCount || tweet.retweets || 0,
+      replies: tweet.replies || 0,
+      url: tweet.permanentUrl || '',
+    }));
 
   return {
     ...summary,
@@ -84,9 +100,6 @@ async function generateAiSummary({ apiKey, model, account, tweets, windowStart, 
     return 'No tweets were posted in this window.';
   }
 
-  const genAI = new GoogleGenerativeAI(apiKey);
-  const generativeModel = genAI.getGenerativeModel({ model: model || DEFAULT_AI_MODEL });
-
   const limitedTweets = tweets
     .slice()
     .sort(
@@ -109,44 +122,250 @@ async function generateAiSummary({ apiKey, model, account, tweets, windowStart, 
     limitedTweets.map((tweet, idx) => formatTweetForPrompt(tweet, idx)).join('\n'),
   ].join('\n');
 
-  const response = await generativeModel.generateContent({
-    contents: [
-      {
-        role: 'user',
-        parts: [{ text: prompt }],
-      },
-    ],
-    generationConfig: {
-      temperature: 0.25,
-      maxOutputTokens: 400,
-    },
+  try {
+    return await generateAiSummaryViaPython({
+      model: model || DEFAULT_AI_MODEL,
+      prompt,
+    });
+  } catch (error) {
+    Logger.warn(`Python AI summary failed for @${account}: ${error.message}`);
+  }
+
+  try {
+    return await generateAiSummaryViaRest({
+      apiKey,
+      model: model || DEFAULT_AI_MODEL,
+      prompt,
+    });
+  } catch (error) {
+    Logger.warn(`REST AI summary failed for @${account}: ${error.message}`);
+    throw error;
+  }
+}
+
+async function renderWithPython(payload) {
+  const rendererPath = path.join(process.cwd(), 'scripts', 'render_report.py');
+  try {
+    await fs.access(rendererPath);
+  } catch {
+    throw new Error('Report renderer script not found.');
+  }
+
+  const payloadPath = path.join(tmpdir(), `finance-report-${randomUUID()}.json`);
+  const htmlPath = path.join(tmpdir(), `finance-report-${randomUUID()}.html`);
+  const textPath = path.join(tmpdir(), `finance-report-${randomUUID()}.txt`);
+
+  await fs.writeFile(payloadPath, JSON.stringify(payload), 'utf-8');
+
+  let renderSucceeded = false;
+  let lastError = null;
+  for (const executable of ['python3', 'python']) {
+    try {
+      await execFileAsync(executable, [
+        rendererPath,
+        '--input',
+        payloadPath,
+        '--html-output',
+        htmlPath,
+        '--text-output',
+        textPath,
+      ], { env: process.env });
+      renderSucceeded = true;
+      break;
+    } catch (error) {
+      lastError = error;
+      if (error.code === 'ENOENT') {
+        continue;
+      }
+      throw error;
+    }
+  }
+
+  if (!renderSucceeded) {
+    throw lastError || new Error('Unable to execute Python renderer.');
+  }
+
+  try {
+    const [htmlOutput, textOutput] = await Promise.all([
+      fs.readFile(htmlPath, 'utf-8'),
+      fs.readFile(textPath, 'utf-8'),
+    ]);
+    return { html: htmlOutput, text: textOutput };
+  } finally {
+    await Promise.allSettled([
+      fs.unlink(payloadPath),
+      fs.unlink(htmlPath),
+      fs.unlink(textPath),
+    ]);
+  }
+}
+
+function buildPlainTextFallback(payload) {
+  const lines = [
+    `Finance Twitter report covering the last ${payload.windowHours} hours`,
+    '',
+    '=== Run Overview ===',
+    `Accounts: ${payload.overview.accounts}`,
+    `Total tweets: ${payload.overview.totalTweets}`,
+    `Engagement totals - likes: ${payload.overview.totalLikes.toLocaleString()}, retweets: ${payload.overview.totalRetweets.toLocaleString()}, replies: ${payload.overview.totalReplies.toLocaleString()}`,
+  ];
+
+  if (payload.overview.earliestStart && payload.overview.latestEnd) {
+    lines.push(
+      `Overall window: ${formatWindow(payload.overview.earliestStart)} to ${formatWindow(payload.overview.latestEnd)}`
+    );
+  }
+  lines.push('');
+
+  for (const account of payload.accounts) {
+    lines.push(`=== @${account.username} ===`);
+    lines.push(
+      `Window: ${formatWindow(account.windowStart)} to ${formatWindow(account.windowEnd)}`
+    );
+    const m = account.metrics;
+    lines.push(
+      `Tweets collected: ${m.total} (originals: ${m.originals}, replies: ${m.replies}, retweets: ${m.retweets})`
+    );
+    lines.push(
+      `Engagement totals - likes: ${toLocaleNumber(m.likes)}, retweets: ${toLocaleNumber(m.engagementRetweets)}, replies: ${toLocaleNumber(m.engagementReplies)}`
+    );
+    lines.push('AI Highlights:');
+    if (account.aiSummary) {
+      account.aiSummary.split('\n').forEach((line) => {
+        lines.push(`  ${line}`);
+      });
+    } else {
+      lines.push('  No highlights available.');
+    }
+
+    if (account.topTweets.length > 0) {
+      lines.push('Top tweets:');
+      account.topTweets.forEach((tweet, idx) => {
+        lines.push(
+          `  ${idx + 1}. [${formatWindow(tweet.timestamp)}] ${tweet.text}`
+        );
+        lines.push(
+          `    likes ${toLocaleNumber(tweet.likes)} | retweets ${toLocaleNumber(tweet.retweets)} | replies ${toLocaleNumber(tweet.replies)}`
+        );
+        if (tweet.url) {
+          lines.push(`    link: ${tweet.url}`);
+        }
+      });
+    } else {
+      lines.push('Top tweets: none in this window.');
+    }
+    lines.push('');
+  }
+
+  return lines.join('\n').trimEnd() + '\n';
+}
+
+
+
+async function generateAiSummaryViaPython({ model, prompt }) {
+  const scriptPath = path.join(process.cwd(), 'scripts', 'ai_summary.py');
+  try {
+    await fs.access(scriptPath);
+  } catch {
+    throw new Error('AI summary script not found.');
+  }
+
+  const payloadPath = path.join(tmpdir(), `ai-summary-${randomUUID()}.json`);
+
+  await fs.writeFile(payloadPath, JSON.stringify({ model, prompt }), 'utf-8');
+
+  let lastError = null;
+  try {
+    for (const executable of ['python3', 'python']) {
+      try {
+        const { stdout } = await execFileAsync(executable, [
+          scriptPath,
+          '--input',
+          payloadPath,
+        ], { env: process.env });
+        const textOutput = stdout.trim();
+        if (!textOutput) {
+          throw new Error('AI summary script returned empty output.');
+        }
+        return textOutput;
+      } catch (error) {
+        lastError = error;
+        if (error.code === 'ENOENT') {
+          continue;
+        }
+        throw error;
+      }
+    }
+    throw lastError || new Error('Python executable not found on PATH.');
+  } finally {
+    await fs.unlink(payloadPath).catch(() => undefined);
+  }
+}
+
+async function generateAiSummaryViaRest({ apiKey, model, prompt }) {
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+  const response = await fetch(endpoint, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      contents: [
+        {
+          role: 'user',
+          parts: [{ text: prompt }],
+        },
+      ],
+    }),
   });
 
-  const text = response?.response?.text()?.trim();
+  if (!response.ok) {
+    const body = await response.text();
+    throw new Error(`REST API call failed (${response.status}): ${body}`);
+  }
+
+  const data = await response.json();
+  const textParts = data?.candidates?.[0]?.content?.parts || [];
+  const text = textParts
+    .map((part) => part.text || '')
+    .join('')
+    .trim();
+
   if (!text) {
-    throw new Error(`AI summary returned no content for @${account}`);
+    throw new Error('REST API call returned no text.');
   }
   return text;
 }
 
 export async function buildEmailContent({ results, windowHours, aiApiKey, aiModel }) {
-  if (!aiApiKey) {
-    throw new Error('GOOGLE_AI_API_KEY must be set to build the report.');
-  }
-
   const now = new Date();
   const subject = `Finance Twitter Report - ${format(now, 'MMM d yyyy HH:mm')}`;
-  const textLines = [
-    `Finance Twitter report covering the last ${windowHours} hours`,
-    '',
-  ];
-  const htmlSections = [
-    '<h1>Finance Twitter Report</h1>',
-    `<p>Coverage window: last ${windowHours} hours</p>`,
-  ];
+
+  const aggregate = {
+    accounts: results.length,
+    totalTweets: 0,
+    totalLikes: 0,
+    totalRetweets: 0,
+    totalReplies: 0,
+    earliestStart: null,
+    latestEnd: null,
+  };
+
+  const accountsPayload = [];
 
   for (const result of results) {
     const metrics = computeMetrics(result.tweets);
+
+    aggregate.totalTweets += metrics.total;
+    aggregate.totalLikes += metrics.likes;
+    aggregate.totalRetweets += metrics.retweetCount;
+    aggregate.totalReplies += metrics.repliesCount;
+
+    if (!aggregate.earliestStart || result.windowStart < aggregate.earliestStart) {
+      aggregate.earliestStart = result.windowStart;
+    }
+    if (!aggregate.latestEnd || result.windowEnd > aggregate.latestEnd) {
+      aggregate.latestEnd = result.windowEnd;
+    }
+
     let aiSummary;
     try {
       aiSummary = await generateAiSummary({
@@ -162,80 +381,46 @@ export async function buildEmailContent({ results, windowHours, aiApiKey, aiMode
       aiSummary = 'AI summary unavailable.';
     }
 
-    textLines.push(`=== @${result.username} ===`);
-    textLines.push(
-      `Window: ${formatWindow(result.windowStart)} to ${formatWindow(result.windowEnd)}`
-    );
-    textLines.push(
-      `Tweets collected: ${metrics.total} (originals: ${metrics.originals}, replies: ${metrics.replies}, retweets: ${metrics.retweets})`
-    );
-    textLines.push(
-      `Engagement totals - likes: ${toLocaleNumber(metrics.likes)}, retweets: ${toLocaleNumber(
-        metrics.retweetCount
-      )}, replies: ${toLocaleNumber(metrics.repliesCount)}`
-    );
-    textLines.push('AI Highlights:');
-    textLines.push(aiSummary);
-
-    if (metrics.topTweets.length > 0) {
-      textLines.push('Top tweets:');
-      metrics.topTweets.forEach((tweet, idx) => {
-        const timeLabel = format(new Date(tweet.timestamp), 'MMM d HH:mm');
-        const cleanText = tweet.text.replace(/\s+/g, ' ').trim();
-        const link = tweet.permanentUrl ? ` => ${tweet.permanentUrl}` : '';
-        textLines.push(
-          `${idx + 1}. [${timeLabel}] ${cleanText} (likes ${toLocaleNumber(
-            tweet.likes
-          )}, retweets ${toLocaleNumber(tweet.retweetCount)}, replies ${toLocaleNumber(
-            tweet.replies
-          )})${link}`
-        );
-      });
-    }
-
-    textLines.push('');
-
-    const htmlSection = [
-      '<section>',
-      `<h2>@${escapeHtml(result.username)}</h2>`,
-      `<p><strong>Window:</strong> ${escapeHtml(formatWindow(result.windowStart))} to ${escapeHtml(
-        formatWindow(result.windowEnd)
-      )}</p>`,
-      `<p><strong>Tweets:</strong> ${metrics.total} (originals: ${metrics.originals}, replies: ${metrics.replies}, retweets: ${metrics.retweets})</p>`,
-      `<p><strong>Engagement totals:</strong> likes ${toLocaleNumber(
-        metrics.likes
-      )} &middot; retweets ${toLocaleNumber(metrics.retweetCount)} &middot; replies ${toLocaleNumber(
-        metrics.repliesCount
-      )}</p>`,
-      `<h3>AI Highlights</h3><p>${escapeHtml(aiSummary)}</p>`,
-    ];
-
-    if (metrics.topTweets.length > 0) {
-      const listItems = metrics.topTweets
-        .map((tweet) => {
-          const timeLabel = format(new Date(tweet.timestamp), 'MMM d HH:mm');
-          const engagement = `likes ${toLocaleNumber(tweet.likes)} &middot; retweets ${toLocaleNumber(
-            tweet.retweetCount
-          )} &middot; replies ${toLocaleNumber(tweet.replies)}`;
-          const link = tweet.permanentUrl
-            ? `<a href="${escapeHtml(tweet.permanentUrl)}">Open</a>`
-            : '';
-          return `<li><strong>${escapeHtml(timeLabel)}</strong> - ${escapeHtml(
-            tweet.text
-          )} <br/><span>${engagement}</span> ${link}</li>`;
-        })
-        .join('');
-
-      htmlSection.push(`<h3>Top Tweets</h3><ul>${listItems}</ul>`);
-    }
-
-    htmlSection.push('</section>');
-    htmlSections.push(htmlSection.join('\n'));
+    accountsPayload.push({
+      username: result.username,
+      windowStart: result.windowStart,
+      windowEnd: result.windowEnd,
+      metrics: {
+        total: metrics.total,
+        originals: metrics.originals,
+        replies: metrics.replies,
+        retweets: metrics.retweets,
+        likes: metrics.likes,
+        engagementRetweets: metrics.retweetCount,
+        engagementReplies: metrics.repliesCount,
+      },
+      aiSummary,
+      topTweets: metrics.topTweets,
+    });
   }
 
-  return {
-    subject,
-    text: textLines.join('\n'),
-    html: htmlSections.join('\n'),
+  const payload = {
+    generatedAt: now.getTime(),
+    windowHours,
+    overview: aggregate,
+    accounts: accountsPayload,
   };
+
+  try {
+    const rendered = await renderWithPython(payload);
+    return {
+      subject,
+      text: rendered.text,
+      html: rendered.html,
+    };
+  } catch (error) {
+    Logger.warn(`Python renderer failed, falling back to plain layout: ${error.message}`);
+    const fallbackText = buildPlainTextFallback(payload);
+    const fallbackHtml = `<pre style="font-family: 'SFMono-Regular', Consolas, monospace; white-space: pre-wrap;">${escapeHtml(fallbackText)}</pre>`;
+    return {
+      subject,
+      text: fallbackText,
+      html: fallbackHtml,
+    };
+  }
 }

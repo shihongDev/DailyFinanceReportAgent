@@ -55,7 +55,17 @@ Provide SMTP credentials (e.g., Gmail app password). Defaults:
 
 ### AI Highlights (required)
 
-Set `GOOGLE_AI_API_KEY` (and optional `GOOGLE_AI_MODEL`) to add Gemini-based bullet summaries of each account’s activity.
+- Ensure Python 3 is available on PATH (`python3` or `python`). The agent uses `scripts/render_report.py` to render the HTML and text emails. If Python is missing, the agent will fall back to a basic layout.
+
+Set `GOOGLE_AI_API_KEY` (and optional `GOOGLE_AI_MODEL`) to add Gemini-based bullet summaries of each accounts' activity.
+
+### Python Environment
+
+1. `conda create -n finance-report python=3.11 -y`
+2. `conda activate finance-report`
+3. `pip install requests`
+
+Ensure the `python3` (or `python`) command resolves to this environment before running the agent.
 
 ## Project Scripts
 
@@ -70,6 +80,13 @@ Set `GOOGLE_AI_API_KEY` (and optional `GOOGLE_AI_MODEL`) to add Gemini-based bul
 - Twitter artifacts: `pipeline/<account>/<timestamp>/`
 - Agent state: `agent_data/state.json`
 - Cookies maintained in `cookies/`
+
+
+
+
+
+
+
 
 
 
