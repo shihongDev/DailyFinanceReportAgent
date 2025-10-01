@@ -41,6 +41,16 @@ class TwitterPipeline {
       `${process.env.TWITTER_USERNAME}_cookies.json`
     );
 
+    // Persistent Chromium profile for fallback (unique per run to avoid lock conflicts)
+    this.browserDataDirBase = path.join(
+      process.cwd(),
+      'cookies'
+    );
+    this.browserDataDir = path.join(
+      this.browserDataDirBase,
+      `${process.env.TWITTER_USERNAME}_puppeteer_${this.runTimestamp.getTime()}_${process.pid}`
+    );
+
     // Enhanced configuration with fallback handling
     this.config = {
       twitter: {
@@ -204,19 +214,47 @@ class TwitterPipeline {
 
   async initializeFallback() {
     if (!this.cluster) {
-      this.cluster = await Cluster.launch({
-        puppeteer,
-        maxConcurrency: 1, // Single instance for consistency
-        timeout: 30000,
-        puppeteerOptions: {
-          headless: "new",
-          args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-blink-features=AutomationControlled",
-          ],
-        },
-      });
+      try {
+        this.cluster = await Cluster.launch({
+          puppeteer,
+          maxConcurrency: 1, // Single instance for consistency
+          timeout: 30000,
+          puppeteerOptions: {
+            headless: "new",
+            userDataDir: this.browserDataDir,
+            args: [
+              "--no-sandbox",
+              "--disable-setuid-sandbox",
+              "--disable-blink-features=AutomationControlled",
+              "--lang=en-US,en",
+              "--window-size=1366,768",
+            ],
+          },
+        });
+      } catch (err) {
+        // If profile dir is locked by another Chromium, retry with a fresh directory
+        Logger.warn(`Fallback launch failed (${err.message}). Retrying with a fresh profile.`);
+        this.browserDataDir = path.join(
+          this.browserDataDirBase,
+          `${process.env.TWITTER_USERNAME}_puppeteer_${Date.now()}_${Math.floor(Math.random()*10000)}`
+        );
+        this.cluster = await Cluster.launch({
+          puppeteer,
+          maxConcurrency: 1,
+          timeout: 30000,
+          puppeteerOptions: {
+            headless: "new",
+            userDataDir: this.browserDataDir,
+            args: [
+              "--no-sandbox",
+              "--disable-setuid-sandbox",
+              "--disable-blink-features=AutomationControlled",
+              "--lang=en-US,en",
+              "--window-size=1366,768",
+            ],
+          },
+        });
+      }
 
       this.cluster.on("taskerror", async (err) => {
         Logger.warn(`Fallback error: ${err.message}`);
@@ -232,6 +270,46 @@ class TwitterPipeline {
     await page.evaluateOnNewDocument(() => {
       Object.defineProperty(navigator, "webdriver", { get: () => undefined });
     });
+
+    // Realistic desktop UA and headers
+    const userAgent =
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+    await page.setUserAgent(userAgent);
+    await page.setExtraHTTPHeaders({
+      "accept-language": "en-US,en;q=0.9",
+      "sec-fetch-site": "same-origin",
+      "sec-fetch-mode": "navigate",
+      "sec-fetch-user": "?1",
+      referer: "https://x.com/",
+    });
+  }
+
+  async loadPageCookies(page) {
+    try {
+      if (await fs.access(this.paths.cookies).catch(() => false)) {
+        const cookiesData = await fs.readFile(this.paths.cookies, 'utf-8');
+        const cookies = JSON.parse(cookiesData);
+        // Only apply cookies for x.com/twitter.com domains
+        const scoped = cookies.map((c) => ({
+          ...c,
+          domain: c.domain && c.domain.includes('twitter') ? c.domain : '.x.com',
+        }));
+        await page.setCookie(...scoped);
+      }
+    } catch (e) {
+      Logger.warn(`Failed to load page cookies: ${e.message}`);
+    }
+  }
+
+  async savePageCookies(page) {
+    try {
+      const cookies = await page.cookies();
+      await fs.mkdir(path.dirname(this.paths.cookies), { recursive: true });
+      await fs.writeFile(this.paths.cookies, JSON.stringify(cookies));
+      Logger.success('Saved browser cookies');
+    } catch (e) {
+      Logger.warn(`Failed to save browser cookies: ${e.message}`);
+    }
   }
 
   async validateEnvironment() {
@@ -508,27 +586,96 @@ async saveCookies() {
       await this.setupFallbackPage(page);
 
       try {
-        // Login with minimal interaction
-        await page.goto("https://twitter.com/login", {
+        // Load cookies first to reduce challenges
+        await this.loadPageCookies(page);
+
+        // Login using x.com flow (more consistent selectors)
+        await page.goto("https://x.com/i/flow/login", {
           waitUntil: "networkidle0",
           timeout: 30000,
         });
 
-        await page.type(
-          'input[autocomplete="username"]',
-          process.env.TWITTER_USERNAME
-        );
-        await this.randomDelay(500, 1000);
-        await page.click('div[role="button"]:not([aria-label])');
-        await this.randomDelay(500, 1000);
-        await page.type('input[type="password"]', process.env.TWITTER_PASSWORD);
-        await this.randomDelay(500, 1000);
-        await page.click('div[role="button"][data-testid="LoginButton"]');
-        await page.waitForNavigation({ waitUntil: "networkidle0" });
+        // Sometimes CF interstitial blocks interactive inputs; detect and retry on x.com
+        const isBlocked = await page.$('h1[data-translate="block_headline"], #cf-error-details');
+        if (isBlocked) {
+          Logger.warn('Cloudflare block detected, retrying with fresh tab and backoff');
+          await this.randomDelay(3000, 7000);
+          await page.goto("https://x.com/login", { waitUntil: "networkidle0", timeout: 30000 });
+        }
+
+        // Step 1: username
+        await page.waitForSelector('input[autocomplete="username"]', { timeout: 20000 });
+        await page.type('input[autocomplete="username"]', process.env.TWITTER_USERNAME, { delay: 50 });
+        await this.randomDelay(300, 700);
+        const nextSelectors = [
+          'div[role="button"][data-testid="LoginForm_Login_Button"]',
+          'div[role="button"][data-testid="ocfEnterTextNextButton"]',
+          'div[role="button"][data-testid="NextButton"]'
+        ];
+        let clickedNext = false;
+        for (const sel of nextSelectors) {
+          const el = await page.$(sel);
+          if (el) {
+            await el.click();
+            clickedNext = true;
+            break;
+          }
+        }
+        if (!clickedNext) {
+          await page.keyboard.press('Enter');
+        }
+        await this.randomDelay(500, 1200);
+
+        // Step 1.5: Sometimes it asks for email/phone verification
+        const emailInput = await page.$('input[name="text"]');
+        if (emailInput && process.env.TWITTER_EMAIL) {
+          await emailInput.type(process.env.TWITTER_EMAIL, { delay: 50 });
+          await this.randomDelay(300, 700);
+          for (const sel of nextSelectors) {
+            const el = await page.$(sel);
+            if (el) {
+              await el.click();
+              break;
+            }
+          }
+          await this.randomDelay(500, 1200);
+        }
+
+        // Step 2: password
+        await page.waitForSelector('input[type="password"], input[name="password"]', { timeout: 20000 });
+        await page.type('input[type="password"], input[name="password"]', process.env.TWITTER_PASSWORD, { delay: 50 });
+        await this.randomDelay(300, 700);
+        const loginSelectors = [
+          'div[role="button"][data-testid="LoginForm_Login_Button"]',
+          'div[role="button"][data-testid="LoginButton"]'
+        ];
+        let clickedLogin = false;
+        for (const sel of loginSelectors) {
+          const el = await page.$(sel);
+          if (el) {
+            await el.click();
+            clickedLogin = true;
+            break;
+          }
+        }
+        if (!clickedLogin) {
+          await page.keyboard.press('Enter');
+        }
+        await page.waitForNavigation({ waitUntil: "networkidle0", timeout: 30000 });
+
+        // If another CF block appears after login, attempt direct search navigation
+        const blockedAfter = await page.$('h1[data-translate="block_headline"], #cf-error-details');
+        if (blockedAfter) {
+          Logger.warn('Cloudflare block after login, attempting direct search navigation');
+          await this.randomDelay(2000, 5000);
+        }
+
+        // Save cookies after successful navigation
+        await this.savePageCookies(page);
 
         // Go directly to search
         await page.goto(
-          `https://twitter.com/search?q=${encodeURIComponent(
+          `https://x.com/search?q=${encodeURIComponent(
             searchQuery
           )}&f=live`
         );
@@ -570,6 +717,14 @@ async saveCookies() {
               })
               .filter((t) => t && t.id);
           });
+
+          // If zero tweets repeatedly, we might be blocked; break and bubble up
+          if (newTweets.length === 0) {
+            unchangedCount++;
+            if (unchangedCount >= 3) {
+              throw new Error('No tweets loaded, possibly blocked');
+            }
+          }
 
           for (const tweet of newTweets) {
             if (this.options.limit && tweets.size >= this.options.limit) {
@@ -618,8 +773,15 @@ async saveCookies() {
 
   async collectTweets(scraper) {
     try {
-      const profile = await scraper.getProfile(this.username);
-      const totalExpectedTweets = profile.tweetsCount;
+      let totalExpectedTweets = 0;
+      try {
+        const profile = await scraper.getProfile(this.username);
+        totalExpectedTweets = profile.tweetsCount || 0;
+      } catch (e) {
+        // If primary scraper fails (404/rate limit), proceed with fallback directly
+        Logger.warn(`Primary profile fetch failed (${e.message}). Switching to fallback search.`);
+        totalExpectedTweets = 0;
+      }
 
       Logger.info(
         ` Found ${chalk.bold(
@@ -716,7 +878,7 @@ async saveCookies() {
         }
 
       } catch (error) {
-        if (error.message.includes("rate limit")) {
+        if (error.message.includes("rate limit") || error.message.includes('404')) {
           await this.handleRateLimit(this.stats.rateLimitHits + 1);
 
           // Consider fallback if rate limits are frequent
@@ -869,10 +1031,8 @@ async saveCookies() {
 
       // Initialize main scraper
       const scraperInitialized = await this.initializeScraper();
-      if (!scraperInitialized && !this.config.fallback.enabled) {
-        throw new Error(
-          "Failed to initialize scraper and fallback is disabled"
-        );
+      if (!scraperInitialized) {
+        Logger.warn("Primary login failed. Switching to fallback-only mode.");
       }
 
       // Start collection
